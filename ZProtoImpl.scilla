@@ -1,0 +1,472 @@
+scilla_version 0
+
+import BoolUtils
+
+library ZProtoImpl
+
+let one = Uint128 1
+let zero = Uint128 0
+let ten_e_six = Uint128 1000000
+let zero_address = 0x0000000000000000000000000000000000000000
+
+let failure_label = "LiquidityManagerFailure"
+
+let token_not_found_code = Uint32 3
+let order_expired_code = Uint32 4
+let order_not_met_code = Uint32 5
+let parameter_is_zero_code = Uint32 6
+let private_function_called_code = Uint32 7
+let bad_balance_code = Uint32 8
+
+let any_zero_double =
+    fun (first : Uint128) =>
+    fun (second : Uint128) =>
+        let f_zero = builtin eq first zero in
+        let s_zero = builtin eq second zero in
+        orb f_zero s_zero
+
+let any_zero_triple =
+    fun (first : Uint128) =>
+    fun (second : Uint128) =>
+    fun (third : Uint128) =>
+        let fs_zero = any_zero_double first second in
+        let t_zero = builtin eq third zero in
+        orb fs_zero t_zero
+
+let ble =
+    fun (b1 : BNum ) =>
+    fun (b2 : BNum ) =>
+        let b1_lt = builtin blt b1 b2 in
+        let b_eq = builtin eq b1 b2 in
+        orb b1_lt b_eq
+
+(* Modified from ZDex *)
+let one_msg =
+    fun (msg : Message) =>
+        let nil_msg = Nil {Message} in
+        Cons {Message} msg nil_msg
+
+let two_msgs =
+    fun (msg1 : Message) =>
+    fun (msg2 : Message) =>
+        let msgs_tmp = one_msg msg2 in
+        Cons {Message} msg1 msgs_tmp
+        
+let le_int =
+  fun (a : Uint128) => fun (b : Uint128) =>
+    let x = builtin lt a b in
+    match x with
+    | True => True
+    | False =>
+      builtin eq a b
+    end
+
+let min_int = 
+    fun (a : Uint128) => fun (b : Uint128) =>
+    let ismin = le_int a b in
+    match ismin with
+        | True => a
+        | False => b
+    end
+    
+
+contract ZProtoImpl
+(hub : ByStr20)
+
+(* Pending tx params *)
+field liquidity_mint_pending : Uint128 = zero
+field liquidity_burn_pending : Uint128 = zero
+field total_supply_pending : Uint128 = zero
+field sender_balance_pending : Uint128 = zero
+field token_reserve_pending : Uint128 = zero
+field sender_pending : ByStr20 = zero_address
+field token_pending : ByStr20 = zero_address
+field lpt_pending : ByStr20 = zero_address
+field zil_sold_pending : Uint128 = zero
+field zil_bought_pending : Uint128 = zero
+field balance_pending : Uint128 = zero
+
+(* What function is currently pending? *)
+field fx_pending : Uint128 = zero
+
+(* Logic for AddLiquidity *)
+transition AddLiquidityCore (token : ByStr20, min_liquidity : Uint128,
+        max_tokens : Uint128, deadline : BNum, total_supply : Option Uint128,
+        sender_balance : Option Uint128, token_reserve : Option Uint128,
+        zil_reserve : Option Uint128, zil_sold : Uint128, sender : ByStr20, lpt_provider : ByStr20)
+    hub_sent = builtin eq _sender hub;
+    match hub_sent with
+    |   True =>
+        blocknumber <- & BLOCKNUMBER;
+        block_valid = ble blocknumber deadline;
+        match block_valid with
+        |   True =>
+            any_param_zero = any_zero_triple max_tokens zil_sold min_liquidity;
+            match any_param_zero with
+            |   False =>
+                match total_supply with
+                |   Some t_s =>
+                    zero_liquidity = builtin eq t_s zero;
+                    match zero_liquidity with
+                    |   False =>
+                        match token_reserve with
+                        |   Some t_r =>
+                            match zil_reserve with
+                            |   Some b =>
+                                zil_reserve = b;
+                                amount_t_r = builtin mul zil_sold t_r;
+                                amount_tr_zr = builtin div amount_t_r zil_reserve;
+                                token_amount = builtin add amount_tr_zr one;
+                                amount_t_s = builtin mul zil_sold t_s;
+                                amount_t_s_t = builtin mul token_amount t_s;
+                                liquidity_minted = builtin div amount_t_s zil_reserve;
+                                l_m_z = builtin div amount_t_s zil_reserve;
+                                l_m_t = builtin div amount_t_s_t t_r;
+                                enough_tokens = le_int token_amount max_tokens;
+                                enough_liquidity = le_int min_liquidity liquidity_minted;
+                                order_met = andb enough_tokens enough_liquidity;
+                                match order_met with
+                                | True =>
+                                    total_supply_new = builtin add t_s liquidity_minted;
+                                    total_supply_pending := total_supply_new;
+                                    sender_pending := sender;
+                                    token_pending := token;
+                                    lpt_pending := lpt_provider;
+                                    l_m_p = min_int l_m_z l_m_t;
+                                    liquidity_mint_pending := l_m_p;
+                                    zil_sold_pending := zil_sold;
+                                    token_reserve_new = builtin add t_r max_tokens;
+                                    token_reserve_pending := token_reserve_new;
+                                    balance_new = builtin add b zil_sold;
+                                    balance_pending := balance_new;
+                                    match sender_balance with
+                                    | Some s_b =>
+                                        sender_balance_new = builtin add s_b liquidity_minted;
+                                        sender_balance_pending := sender_balance_new;
+                                        msg1 = { _tag : "TransferFrom"; _recipient : token; _amount : zero;
+                                                from : sender; to : hub; tokens : token_amount};
+                                        msg2 = { _tag : "Mint"; _recipient : lpt_provider; _amount : zero;
+                                            to : sender; value : l_m_p};
+                                        msgs = two_msgs msg1 msg2;
+                                        send msgs
+                                |   None =>
+                                        sender_balance_pending := liquidity_minted;
+                                        msg1 = { _tag : "TransferFrom"; _recipient : token; _amount : zero;
+                                                from : sender; to : hub; tokens : token_amount};
+                                        msg2 = { _tag : "Mint"; _recipient : lpt_provider; _amount : zero;
+                                            to : sender; value : l_m_p};
+                                        msgs = two_msgs msg1 msg2;
+                                        send msgs
+                                    end
+                                |   False =>
+                                    msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                            sender : sender; refund : zil_sold; label : failure_label;
+                                            code : order_not_met_code };
+                                    msgs = one_msg msg;
+                                    send msgs
+                                end
+                            |   None =>
+                                msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                        sender : sender; refund : zil_sold; label : failure_label;
+                                        code : token_not_found_code };
+                                msgs = one_msg msg;
+                                send msgs
+                            end
+                        |   None =>
+                            msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                    sender : sender; refund : zil_sold; label : failure_label;
+                                    code : token_not_found_code };
+                            msgs = one_msg msg;
+                            send msgs
+                        end
+                    |   True =>
+                        match zil_reserve with
+                        |   Some b =>
+                            enough_sold = le_int ten_e_six zil_sold;
+                            match enough_sold with
+                            |   True =>
+                                total_supply_pending := b;
+                                sender_balance_pending := b;
+                                sender_pending := sender;
+                                token_pending := token;
+                                zil_sold_pending := zil_sold;
+                                token_reserve_pending := max_tokens;
+                                balance_new = builtin add b zil_sold;
+                                balance_pending := balance_new;
+                                amount_z_t = builtin mul zil_sold max_tokens;
+                                amount_z_t_sq = builtin isqrt amount_z_t;
+                                l_m_p = builtin sub amount_z_t_sq min_liquidity;
+                                liquidity_mint_pending := l_m_p;
+                                msg1 = { _tag : "TransferFrom"; _recipient : token; _amount : zero;
+                                        from : sender; to : hub; tokens : max_tokens };
+                                msg2 = { _tag : "mint"; _recipient : token; _amount : zero;
+                                        from : lpt_provider; to : sender; tokens : l_m_p};
+                                msgs = two_msgs msg1 msg2;
+                                send msgs
+                            |   False =>
+                                msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                        sender : sender; refund : zil_sold; label : failure_label;
+                                        code : order_not_met_code };
+                                msgs = one_msg msg;
+                                send msgs
+                            end
+                        |   None =>
+                            msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                    sender : sender; refund : zil_sold; label : failure_label;
+                                    code : token_not_found_code };
+                            msgs = one_msg msg;
+                            send msgs
+                        end
+                    end
+                |   None =>
+                    msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                            sender : sender; refund : zil_sold; label : failure_label;
+                            code : token_not_found_code };
+                    msgs = one_msg msg;
+                    send msgs
+                end
+            |   True =>
+                msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                        sender : sender; refund : zil_sold; label : failure_label;
+                        code : parameter_is_zero_code };
+                msgs = one_msg msg;
+                send msgs
+            end
+        |   False =>
+            msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                    sender : sender; refund : zil_sold; label : failure_label;
+                    code : order_expired_code };
+            msgs = one_msg msg;
+            send msgs
+        end
+    |   False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : sender; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
+
+transition RemoveLiquidityCore (token : ByStr20, amount : Uint128, min_zil : Uint128,
+        min_tokens : Uint128, deadline : BNum, recipient : ByStr20,
+        total_supply : Option Uint128, sender_balance : Option Uint128, token_reserve : Option Uint128,
+        balance : Option Uint128, sender : ByStr20)
+    hub_sent = builtin eq _sender hub;
+    match hub_sent with
+    |   True =>
+        blocknumber <- & BLOCKNUMBER;
+        block_valid = ble blocknumber deadline;
+        match block_valid with
+        |   True =>
+            any_param_zero = any_zero_triple amount min_zil min_tokens;
+            match any_param_zero with
+            |   False =>
+                match total_supply with
+                |   Some t_s =>
+                    t_s_zero = builtin eq t_s zero;
+                    match t_s_zero with
+                    |   False =>
+                        match token_reserve with
+                        |   Some t_r =>
+                            match balance with
+                            |   Some b =>
+                                amount_bal = builtin mul amount b;
+                                zil_amount = builtin div amount_bal t_s;
+                                amount_t_r = builtin mul amount t_r;
+                                token_amount = builtin div amount_t_r t_s;
+                                enough_zil = le_int min_zil zil_amount;
+                                enough_tokens = le_int min_tokens token_amount;
+                                amount_t_s_t = builtin mul token_amount t_s;
+                                l_m_t = builtin div amount_t_s_t t_r;
+                                order_met = andb enough_tokens enough_zil;
+                                match order_met with
+                                |   True =>
+                                    match sender_balance with
+                                    |   Some s_b =>
+                                        sender_pending := sender;
+                                        token_pending := token;
+                                        sender_balance_new = builtin sub s_b amount;
+                                        sender_balance_pending := sender_balance_new;
+                                        total_supply_new = builtin sub t_s amount;
+                                        total_supply_pending := total_supply_new;
+                                        zil_bought_pending := zil_amount;
+                                        token_reserve_new = builtin sub t_r token_amount;
+                                        token_reserve_pending := token_reserve_new;
+                                        balance_new = builtin sub b amount;
+                                        balance_pending := balance_new;
+                                        liquidity_burn_pending := l_m_t;
+                                        msg1 = { _tag : "TransferFrom"; _recipient : token; _amount : zero;
+                                                from : hub; to : recipient; tokens : token_amount};
+                                        msg2 = { _tag : "Burn"; _recipient : lpt_provider; _amount : zero;
+                                            from : sender; value : l_m_t};
+                                        msgs = two_msgs msg1 msg2;
+                                        send msgs
+                                    |   None =>
+                                        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                                sender : sender; refund : zero; label : failure_label;
+                                                code : bad_balance_code };
+                                        msgs = one_msg msg;
+                                        send msgs
+                                    end
+                                |   False =>
+                                    msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                            sender : sender; refund : zero; label : failure_label;
+                                            code : order_not_met_code };
+                                    msgs = one_msg msg;
+                                    send msgs
+                                end
+                            |   None =>
+                                msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                        sender : sender; refund : zero; label : failure_label;
+                                        code : token_not_found_code };
+                                msgs = one_msg msg;
+                                send msgs
+                            end
+                        |   None =>
+                            msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                    sender : sender; refund : zero; label : failure_label;
+                                    code : token_not_found_code };
+                            msgs = one_msg msg;
+                            send msgs
+                        end
+                    |   True =>
+                        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                                sender : sender; refund : zero; label : failure_label;
+                                code : parameter_is_zero_code };
+                        msgs = one_msg msg;
+                        send msgs
+                    end
+                |   None =>
+                    msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                            sender : sender; refund : zero; label : failure_label;
+                            code : token_not_found_code };
+                    msgs = one_msg msg;
+                    send msgs
+                end
+            |   True =>
+                msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                        sender : sender; refund : zero; label : failure_label;
+                        code : parameter_is_zero_code };
+                msgs = one_msg msg;
+                send msgs
+            end
+        |   False =>
+            msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                    sender : sender; refund : zero; label : failure_label;
+                    code : order_expired_code };
+            msgs = one_msg msg;
+            send msgs
+        end
+    |   False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : sender; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
+
+(** Response Functions **)
+transition TransferFromSuccess (sender : ByStr20, recipient : ByStr20, amount : Uint128)
+    t_p <- token_pending;
+    token_sent = builtin eq t_p _sender;
+    match token_sent with
+    |   True =>
+        s_b_p <- sender_balance_pending;
+        t_s_p <- total_supply_pending;
+        t_r_p <- token_reserve_pending;
+        s_p <- sender_pending;
+        t_p <- token_pending;
+        z_b_p <- zil_bought_pending;
+        b_p <- balance_pending;
+        sender_balance_pending := zero;
+        total_supply_pending := zero;
+        token_reserve_pending := zero;
+        (* sender_pending := zero_address; *)
+        (* token_pending := zero_address; *)
+        zil_sold_pending := zero;
+        zil_bought_pending := zero;
+        balance_pending := zero;
+        msg = { _tag : "LiquidityManagerSuccess"; _recipient : hub; _amount : zero;
+                sender : s_p; refund : z_b_p; token : t_p; total_supply_new : t_s_p;
+                token_reserve_new : t_r_p;  sender_balance_new : s_b_p; token_zil_balance_new : b_p };
+        msgs = one_msg msg;
+        send msgs
+    |   False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : sender; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
+
+transition TransferFromFailure (sender : ByStr20, recipient : ByStr20, amount : Uint128)
+    t_p <- token_pending;
+    token_sent = builtin eq t_p _sender;
+    match token_sent with
+    |   True =>
+        s_p <- sender_pending;
+        z_s_p <- zil_sold_pending;
+        sender_balance_pending := zero;
+        total_supply_pending := zero;
+        token_reserve_pending := zero;
+        (* sender_pending := zero_address; *)
+        (* token_pending := zero_address; *)
+        zil_sold_pending := zero;
+        zil_bought_pending := zero;
+        balance_pending := zero;
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : s_p; refund : z_s_p; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    |   False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : sender; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
+
+transition MintSuccess (recipient : ByStr20, amount : Uint128)
+    l_p <- lpt_pending;
+    token_mint = builtin eq l_p _sender;
+    match token_mint with
+    | True =>
+        s_p <- sender_pending;
+        t_p <- token_pending;
+        msg = { _tag : "MintSuccess"; _recipient : hub; _amount : zero;
+                recipient : s_p; token : t_p; lpt_balance_new : amount };
+        msgs = one_msg msg;
+        send msgs
+    | False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : recipient; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
+
+transition BurnSuccess (sender : ByStr20, amount : Uint128)
+    l_p <- lpt_pending;
+    token_burn = builtin eq l_p _sender;
+    match token_burn with
+    |   True =>
+        s_p <- sender_pending;
+        t_p <- token_pending;
+        msg = { _tag : "BurnSuccess"; _recipient : hub; _amount : zero;
+                sender : s_p; token : t_p; lpt_balance_new : amount };
+        msgs = one_msg msg;
+        send msgs
+    |   False =>
+        msg = { _tag : "ActionFailure"; _recipient : hub; _amount : zero;
+                sender : sender; refund : zero; label : failure_label;
+                code : private_function_called_code };
+        msgs = one_msg msg;
+        send msgs
+    end
+end
